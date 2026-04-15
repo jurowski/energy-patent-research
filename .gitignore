@@ -1,6 +1,6 @@
 __pycache__/
 *.pyc
-*.db
+# *.db  (intentionally committed — see data/patents.db)
 .env
 .venv/
 venv/
