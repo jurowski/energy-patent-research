@@ -5,11 +5,16 @@ Usage:
     python3 fetch_patents.py --init --seed       # Initialize DB with seed data
     python3 fetch_patents.py --query "resonant electrolysis"
     python3 fetch_patents.py --bulk               # Run all predefined searches
+    python3 fetch_patents.py --enrich             # Backfill claims/CPC/IPC/full abstract
+    python3 fetch_patents.py --enrich --limit 5   # Enrich just the first 5 (dry test)
+    python3 fetch_patents.py --derive             # Derive efficiency_claims/key_features
     python3 fetch_patents.py --stats              # Show database stats
 """
 
 import argparse
+import html
 import json
+import re
 import sqlite3
 import urllib.request
 import urllib.parse
@@ -20,6 +25,8 @@ from pathlib import Path
 from datetime import datetime
 
 DB_PATH = Path(__file__).parent.parent / "data" / "patents.db"
+
+USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
 
 
 def init_db():
@@ -137,6 +144,290 @@ def store_patents(conn: sqlite3.Connection, patents: list[dict], category: str, 
         new_count += 1
     conn.commit()
     return new_count
+
+
+# ─── Per-patent Enrichment ────────────────────────────────
+#
+# The search endpoint only returns a truncated snippet + basic metadata. The
+# per-patent HTML page carries the full abstract, CPC/IPC classifications, and
+# the claims text. The hivejournal importer renders all of these, so we backfill
+# them here into the columns declared in init_db() but left empty by the search.
+
+
+def http_get(url: str, timeout: int = 30, retries: int = 3) -> str | None:
+    """Fetch a URL as text, backing off on rate limits."""
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read().decode("utf-8", "ignore")
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return None
+            if e.code in (429, 503) and attempt < retries - 1:
+                wait = 10 * (attempt + 1)
+                print(f"    Rate limited ({e.code}), waiting {wait}s...")
+                time.sleep(wait)
+                continue
+            return None
+        except Exception:
+            if attempt < retries - 1:
+                time.sleep(5)
+                continue
+            return None
+    return None
+
+
+def _parse_abstract(page: str) -> str:
+    """Full abstract from the on-page section, falling back to the meta tag."""
+    sec = re.search(r'<section itemprop="abstract".*?</section>', page, re.S)
+    if sec:
+        t = re.sub(r"<[^>]+>", " ", sec.group(0))
+        t = html.unescape(t)
+        t = re.sub(r"\s+", " ", t).strip()
+        t = re.sub(r"^Abstract\s*", "", t)
+        if len(t) > 30:
+            return t
+    m = re.search(r'<meta name="description" content="([^"]*)"', page)
+    return html.unescape(m.group(1).strip()) if m else ""
+
+
+def _parse_classifications(page: str) -> tuple[list[str], list[str]]:
+    """Leaf-level CPC and IPC codes, in document order, de-duplicated.
+
+    Each classification node renders its code in a <span itemprop="Code"> and
+    marks leaves with <meta itemprop="Leaf" content="true">. CPC vs IPC is
+    distinguished by the nearest preceding IsCPC flag.
+    """
+    cpc: list[str] = []
+    ipc: list[str] = []
+    for leaf in re.finditer(r'itemprop="Leaf" content="true"', page):
+        window = page[max(0, leaf.start() - 400) : leaf.start()]
+        codes = re.findall(r'itemprop="Code">([^<]+)</span>', window)
+        if not codes:
+            continue
+        code = html.unescape(codes[-1]).strip()
+        is_cpc = window.rfind('itemprop="IsCPC" content="true"') > window.rfind(
+            'itemprop="IsCPC" content="false"'
+        )
+        (cpc if is_cpc else ipc).append(code)
+
+    def dedup(seq: list[str]) -> list[str]:
+        seen: list[str] = []
+        for item in seq:
+            if item not in seen:
+                seen.append(item)
+        return seen
+
+    return dedup(cpc), dedup(ipc)
+
+
+def _parse_claims(page: str) -> str:
+    """Cleaned, human-readable claims text from the claims section."""
+    sec = re.search(r'<section itemprop="claims".*?</section>', page, re.S)
+    if not sec:
+        return ""
+    t = re.sub(r"</(div|p|li|section|h[1-6])>", "\n", sec.group(0))
+    t = re.sub(r"<[^>]+>", "", t)
+    t = html.unescape(t)
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n[ \t]+", "\n", t)
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+    t = re.sub(r"^Claims\s*\(\s*\d+\s*\)\s*", "", t)  # drop the "Claims ( N )" header
+    return t.strip()
+
+
+def fetch_patent_detail(patent_number: str) -> dict | None:
+    """Fetch and parse the Google Patents detail page for one patent."""
+    url = f"https://patents.google.com/patent/{urllib.parse.quote(patent_number)}/en"
+    page = http_get(url)
+    if not page:
+        return None
+    cpc, ipc = _parse_classifications(page)
+    return {
+        "abstract": _parse_abstract(page),
+        "cpc_codes": ", ".join(cpc),
+        "ipc_codes": ", ".join(ipc),
+        "claims_text": _parse_claims(page),
+    }
+
+
+def enrich_patents(conn: sqlite3.Connection, limit: int = 0, force: bool = False, delay: float = 2.0):
+    """Backfill abstract/claims/CPC/IPC for patents missing that detail.
+
+    By default only rows without claims_text are fetched (resumable); --force
+    re-fetches everything. The existing abstract is only replaced when the
+    detail page yields a longer one, so we never overwrite a good abstract with
+    an empty foreign-patent page.
+    """
+    c = conn.cursor()
+    if force:
+        c.execute("SELECT patent_number, abstract FROM patents ORDER BY patent_number")
+    else:
+        c.execute(
+            "SELECT patent_number, abstract FROM patents "
+            "WHERE claims_text IS NULL OR TRIM(claims_text) = '' "
+            "ORDER BY patent_number"
+        )
+    rows = c.fetchall()
+    if limit > 0:
+        rows = rows[:limit]
+
+    print(f"Enriching {len(rows)} patents (force={force}, delay={delay}s)...\n")
+    enriched = failed = 0
+    for i, (pnum, existing_abstract) in enumerate(rows):
+        detail = fetch_patent_detail(pnum)
+        if detail is None:
+            failed += 1
+            print(f"  [{i+1}/{len(rows)}] {pnum:16s} — no page found")
+        else:
+            # Keep the better abstract: prefer the full one, keep old if longer.
+            new_abstract = detail["abstract"]
+            if not new_abstract or len(new_abstract) < len(existing_abstract or ""):
+                new_abstract = existing_abstract
+            c.execute(
+                """
+                UPDATE patents
+                   SET abstract = ?, cpc_codes = ?, ipc_codes = ?,
+                       claims_text = ?, updated_at = ?
+                 WHERE patent_number = ?
+                """,
+                (
+                    new_abstract,
+                    detail["cpc_codes"] or None,
+                    detail["ipc_codes"] or None,
+                    detail["claims_text"] or None,
+                    datetime.now().isoformat(),
+                    pnum,
+                ),
+            )
+            conn.commit()
+            enriched += 1
+            print(
+                f"  [{i+1}/{len(rows)}] {pnum:16s} — "
+                f"abstract:{len(new_abstract or '')} cpc:{detail['cpc_codes'].count(',')+1 if detail['cpc_codes'] else 0} "
+                f"claims:{len(detail['claims_text'])}"
+            )
+        if i < len(rows) - 1:
+            time.sleep(delay)
+
+    print(f"\nEnrichment complete: {enriched} enriched, {failed} not found.")
+    return {"enriched": enriched, "failed": failed}
+
+
+# ─── Field Derivation (efficiency_claims / key_features) ──
+#
+# These two columns aren't on the patent page — they're what the pattern
+# analysis cares about. We derive them deterministically (no API keys, fully
+# reproducible) from the enriched abstract + claims: efficiency_claims collects
+# sentences carrying an efficiency/energy-gain signal; key_features summarizes
+# what claim 1 says the device *is* and what distinguishes it.
+
+# Signals that mark a sentence as an efficiency / energy-performance claim.
+_EFFICIENCY_SIGNALS = [
+    r"\befficien\w*",
+    r"\bcoefficient of performance\b", r"\bC\.?O\.?P\.?\b",
+    r"\bover[\s-]?unity\b", r"\bgreater than unity\b", r"\bgreater than 100\s*%",
+    r"\bexcess (?:heat|energy|power)\b", r"\banomalous (?:heat|energy)\b",
+    r"\bconservation of energy\b", r"\bperpetual\b",
+    r"\bfree energy\b", r"\bzero[\s-]?point\b", r"\bradiant energy\b",
+    r"\benergy gain\b", r"\bself[\s-]?(?:running|sustain\w*)\b",
+    r"\bout(?:put)? .{0,30}? (?:exceed|greater|more) .{0,20}?in(?:put)?\b",
+    r"\bFaraday\b", r"\bhydrino\b", r"\bcold fusion\b",
+    r"\bhigh(?:er|ly)?[\s-]?efficien\w*", r"\b\d{2,3}\s?%",
+    r"\bkWh\b", r"\bfuel (?:gas|cell)\b",
+]
+_EFFICIENCY_RE = re.compile("|".join(_EFFICIENCY_SIGNALS), re.IGNORECASE)
+
+# Where a claim stops reciting the device and starts reciting its novelty.
+_DISTINGUISH_RE = re.compile(
+    r"characterized (?:in that|by)|wherein|其特征在于", re.IGNORECASE
+)
+
+
+def _split_sentences(text: str) -> list[str]:
+    parts = re.split(r"(?<=[.;])\s+|\n+|(?<=[。；])", text)
+    return [p.strip() for p in parts if p and p.strip()]
+
+
+def _derive_efficiency_claims(abstract: str, claims: str) -> str:
+    """Collect the sentences that actually assert an efficiency/energy claim."""
+    seen: list[str] = []
+    for sent in _split_sentences(f"{abstract or ''} {claims or ''}"):
+        if len(sent) < 12 or len(sent) > 400:
+            continue
+        if _EFFICIENCY_RE.search(sent):
+            norm = sent.rstrip(".;")
+            if norm not in seen:
+                seen.append(norm)
+        if len(seen) >= 6:
+            break
+    return "\n".join(f"- {s}" for s in seen)
+
+
+def _derive_key_features(claims: str) -> str:
+    """One-line-ish summary of claim 1: what it is + what distinguishes it."""
+    if not claims:
+        return ""
+    # Isolate claim 1 (up to the start of claim 2).
+    m = re.search(r"(?:^|\n)\s*1[.。]\s*(.+?)(?=\n\s*2[.。]\s|\Z)", claims, re.S)
+    claim1 = (m.group(1) if m else claims).strip()
+    claim1 = re.sub(r"^Translated from Chinese\s*", "", claim1, flags=re.I).strip()
+
+    # Preamble: what the device *is*, before it starts enumerating parts.
+    preamble = re.split(
+        r"\bcomprising\b|\bconsisting of\b|characterized|wherein|其特征在于|:",
+        claim1, maxsplit=1, flags=re.IGNORECASE,
+    )[0].strip(" ,;")
+
+    # Distinguishing clause: the novelty the claim hangs on.
+    dm = _DISTINGUISH_RE.search(claim1)
+    distinguish = ""
+    if dm:
+        distinguish = claim1[dm.end():].strip(" ,;")
+        distinguish = _split_sentences(distinguish)[0] if distinguish else ""
+
+    parts = []
+    if preamble:
+        parts.append(preamble[:280])
+    if distinguish:
+        parts.append(f"Distinguished by: {distinguish[:280]}")
+    return "\n\n".join(parts)
+
+
+def derive_patents(conn: sqlite3.Connection, force: bool = False):
+    """Fill efficiency_claims and key_features from enriched abstract + claims."""
+    c = conn.cursor()
+    if force:
+        c.execute("SELECT patent_number, abstract, claims_text FROM patents")
+    else:
+        c.execute(
+            "SELECT patent_number, abstract, claims_text FROM patents "
+            "WHERE (efficiency_claims IS NULL OR TRIM(efficiency_claims) = '') "
+            "   OR (key_features IS NULL OR TRIM(key_features) = '')"
+        )
+    rows = c.fetchall()
+    print(f"Deriving efficiency_claims / key_features for {len(rows)} patents...")
+
+    eff_filled = feat_filled = 0
+    for pnum, abstract, claims in rows:
+        eff = _derive_efficiency_claims(abstract or "", claims or "")
+        feat = _derive_key_features(claims or "")
+        if eff:
+            eff_filled += 1
+        if feat:
+            feat_filled += 1
+        c.execute(
+            "UPDATE patents SET efficiency_claims = ?, key_features = ?, updated_at = ? "
+            "WHERE patent_number = ?",
+            (eff or None, feat or None, datetime.now().isoformat(), pnum),
+        )
+    conn.commit()
+    print(
+        f"Done: efficiency_claims filled for {eff_filled}, "
+        f"key_features for {feat_filled} of {len(rows)}."
+    )
+    return {"efficiency": eff_filled, "features": feat_filled}
 
 
 def add_patent_manually(conn: sqlite3.Connection, patent_data: dict):
@@ -299,6 +590,16 @@ def main():
     parser.add_argument("--init", action="store_true", help="Initialize the database")
     parser.add_argument("--stats", action="store_true", help="Show database statistics")
     parser.add_argument("--num", "-n", type=int, default=20, help="Results per query (default 20)")
+    parser.add_argument("--enrich", action="store_true",
+                        help="Backfill abstract/claims/CPC/IPC from per-patent pages")
+    parser.add_argument("--force", action="store_true",
+                        help="With --enrich, re-fetch all patents (not just those missing claims)")
+    parser.add_argument("--limit", type=int, default=0,
+                        help="With --enrich, cap the number of patents fetched (0 = no cap)")
+    parser.add_argument("--delay", type=float, default=2.0,
+                        help="With --enrich, seconds to wait between patent fetches (default 2)")
+    parser.add_argument("--derive", action="store_true",
+                        help="Derive efficiency_claims/key_features from enriched abstract+claims")
     args = parser.parse_args()
 
     conn = init_db()
@@ -314,6 +615,16 @@ def main():
 
     if args.stats:
         print_stats(conn)
+        conn.close()
+        return
+
+    if args.enrich:
+        enrich_patents(conn, limit=args.limit, force=args.force, delay=args.delay)
+        conn.close()
+        return
+
+    if args.derive:
+        derive_patents(conn, force=args.force)
         conn.close()
         return
 
