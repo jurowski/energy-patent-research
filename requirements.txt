@@ -1,0 +1,13 @@
+# The scraping/analysis scripts (fetch_patents.py, analyze_patterns.py) are
+# stdlib-only and need nothing here.
+#
+# The enrichment + semantic-analysis scripts (enrich_patents.py Stage B,
+# semantic_clusters.py) call the Anthropic API. They need a recent SDK —
+# `output_config` structured outputs and the Message Batches API must be
+# available. If you hit an "unexpected keyword argument 'output_config'" or a
+# similar error, upgrade: `pip install -U anthropic`.
+#
+# Auth is NOT stored here: the SDK reads your key from ANTHROPIC_API_KEY or an
+# `ant auth login` profile. No key is ever committed — the "no secrets"
+# principle holds; only the dependency is declared.
+anthropic>=0.69.0

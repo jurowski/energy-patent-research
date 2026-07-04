@@ -12,8 +12,12 @@ All findings published openly — **no patents, no secrets, no paywalls.**
 | `research/` | Per-category research notes: `electrochemical/`, `electromagnetic/`, `plasma/`, `solid-state/`, `thermodynamic/`, `suppressed-or-classified/` |
 | `patterns/` | The **10 recurring technical patterns** identified across the corpus — coil geometry, pulsed DC, resonance, plasma discharge, magnet topologies, anomalous water splitting, LENR, feedback/self-oscillation, special materials, and the synthesis that combines them. Each file includes patents referenced, underlying physics, and actionable bench experiments with materials lists. Start at [`patterns/README.md`](patterns/README.md). |
 | `designs/` | Open-source device concepts derived from pattern analysis (work in progress) |
-| `scripts/fetch_patents.py` | Regenerates `data/patents.db` from public patent sources (USPTO / Google Patents / EPO / WIPO) |
-| `scripts/analyze_patterns.py` | Runs the cross-patent analysis that produced the `patterns/` files |
+| `scripts/fetch_patents.py` | Regenerates `data/patents.db` from public patent sources (USPTO / Google Patents / EPO / WIPO). Stdlib only. |
+| `scripts/analyze_patterns.py` | Regex keyword-frequency analysis (the original, hypothesis-shaped pass). Stdlib only. |
+| `scripts/enrich_patents.py` | Backfills full `claims_text` (scrape) + `efficiency_claims` / `key_features` (LLM read). Needs an API key — see [Enriching the corpus](#enriching-the-corpus). |
+| `scripts/semantic_clusters.py` | Model-read cross-patent synthesis — supersedes `analyze_patterns.py`; writes `patterns/11_semantic_synthesis.md`. Needs an API key. |
+| `scripts/anthropic_batch.py` | Shared Message Batches helper used by the two scripts above. |
+| `requirements.txt` | Python deps for the enrichment scripts (just `anthropic`). |
 | `RESEARCH_PLAN.md` | Overall goals + methodology |
 | `CLAUDE.md` | Project brief for AI assistants working on this repo |
 
@@ -45,6 +49,36 @@ FROM patents
 WHERE efficiency_claims LIKE '%over%unity%'
    OR efficiency_claims LIKE '%100%';
 ```
+
+## Enriching the corpus
+
+The committed `patents.db` is thin — title, a one-sentence abstract, dates, and
+codes. `claims_text`, `efficiency_claims`, and `key_features` are empty. Two
+optional scripts deepen it and run a model-read analysis in place of the regex
+pass. They call the Anthropic API, so they need a key and one dependency:
+
+```bash
+pip install -r requirements.txt
+
+# Auth: the SDK reads ANTHROPIC_API_KEY (or an `ant auth login` profile).
+# Nothing is stored in the repo — "no secrets" still holds.
+export ANTHROPIC_API_KEY=sk-ant-...
+
+# 1. Backfill claims (scrape, stdlib) then extracted fields (LLM). --batch = 50% cheaper, async.
+python scripts/enrich_patents.py --fetch
+python scripts/enrich_patents.py --extract --batch
+
+# 2. Model-read fingerprints → cross-patent synthesis (patterns/11_semantic_synthesis.md)
+python scripts/semantic_clusters.py --map --batch
+python scripts/semantic_clusters.py --reduce
+
+# Trial the LLM steps on a handful of rows first: add --limit 15
+```
+
+The scrape legitimately fails on pre-1976 patents with no OCR'd full text (Tesla
+et al.) — those stay null and are recorded, not fatal. All **outputs** (enriched
+DB, `data/fingerprints.json`, the synthesis file) stay open under CC BY-SA, same
+as everything else here — only the tooling needs a key.
 
 ## The Meta-Pattern
 
