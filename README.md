@@ -80,22 +80,33 @@ et al.) — those stay null and are recorded, not fatal. All **outputs** (enrich
 DB, `data/fingerprints.json`, the synthesis file) stay open under CC BY-SA, same
 as everything else here — only the tooling needs a key.
 
-## The Meta-Pattern
+## The Meta-Pattern (corrected 2026-07)
 
-The most promising devices across the corpus share three elements:
+The original keyword analysis proposed a three-element recipe — *non-linear +
+resonance + pulsed excitation*. A mechanism-level re-read of the enriched corpus
+(766 of 768 patents fingerprinted) found that combination in only **13 patents**,
+and only **6** of those claim an anomalous effect: **the recipe was largely a
+keyword artifact.** 72% of the corpus has no non-linear element; 83% has no
+resonance.
 
-1. **Non-linear element** — saturating magnetic core, plasma gap, ferroelectric
-2. **Resonance** — LC circuit, mechanical, or acoustic
-3. **Pulsed excitation** — sharp edges, capacitor discharge, impulse
+The real anomalous signal is **independent-inventor convergence** — the same
+mechanism template reached by unrelated filers across decades and countries.
+~101 patents claim a genuinely anomalous effect, clustering into a few templates:
+Casimir / ambient-EM → DC, resonant water dissociation, back-EMF recovery loops,
+and metal-hydride LENR excess heat.
 
-Patterns 1-9 each capture one facet; [`patterns/10_synthesis.md`](patterns/10_synthesis.md) ties them together and ranks experiments by cost and signal strength. Level 1 (single-element) through Level 3 (three-element combinations) covers ~25 experiments total with estimated parts cost **$200-500**.
+See [`patterns/11_semantic_synthesis.md`](patterns/11_semantic_synthesis.md) for
+the model-read analysis and [`patterns/12_revised_experiment_priorities.md`](patterns/12_revised_experiment_priorities.md)
+for the revised, falsification-first experiment ranking (6 experiments, ~$30–200
+each). Patterns 1–10 are retained for provenance; the original 29 experiments
+remain valid as component-characterization work.
 
 ## How this feeds into HiveJournal
 
 This repo is pinned as a git submodule inside [`hivejournal-2026`](https://github.com/jurowski/hivejournal-2026) at `vendor/energy-patent-research/`. HiveJournal's `scripts/import-energy-patents.ts` reads directly from:
 
 - `data/patents.db` → seeds the **Patents** notebook (768 entries, one per patent)
-- `patterns/*.md` → seeds the **Experiments** notebook (29 experiment entries cross-referencing their source patents)
+- `patterns/*.md` → seeds the **Experiments** notebook (29 original + 6 revised-priority experiment entries cross-referencing their source patents)
 
 Those notebooks power the [hivejournal.com/open-energy](https://hivejournal.com/open-energy) 10-phase pathway, the Constellation view, and the Cheer Dashboard. This repo is the upstream data pipeline; HiveJournal is the product surface.
 

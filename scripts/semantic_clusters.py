@@ -30,6 +30,8 @@ Requires enrich_patents.py to have run (claims_text / key_features populated) an
 `pip install anthropic`. Auth resolves from the environment / `ant auth login`.
 """
 
+from __future__ import annotations  # allow `int | None` etc. on Python 3.9
+
 import argparse
 import json
 import sqlite3
@@ -102,10 +104,21 @@ def _fable_kwargs(model: str) -> dict:
 
 
 def _map_params(patent: dict, model: str) -> dict:
-    """messages.create kwargs for one fingerprint — shared by threaded + batch paths."""
-    source = patent.get("claims_text") or (
-        f"TITLE: {patent.get('title','')}\nFEATURES: {patent.get('key_features','')}\n"
-        f"EFFICIENCY: {patent.get('efficiency_claims','')}")
+    """messages.create kwargs for one fingerprint — shared by threaded + batch paths.
+
+    Prefer the distilled key_features (an LLM mechanism summary already extracted
+    from the claims) over raw claims_text: ~20x fewer tokens, and purpose-built for
+    exactly this mechanism-classification step. Fall back to claims for the rare
+    unenriched row.
+    """
+    kf = patent.get("key_features")
+    source = (
+        f"TITLE: {patent.get('title', '')}\n"
+        f"MECHANISM: {kf}\n"
+        f"EFFICIENCY: {patent.get('efficiency_claims') or 'none stated'}"
+        if kf
+        else (patent.get("claims_text") or patent.get("title", ""))
+    )
     return {
         "model": model,
         "max_tokens": 1200,
@@ -121,6 +134,20 @@ def _finish_fp(fp: dict, patent: dict) -> dict:
     fp.update({"patent_number": patent["patent_number"], "title": patent["title"],
                "category": patent["category"], "inventor": patent["inventor"]})
     return fp
+
+
+def _parse_fp(msg) -> dict | None:
+    """Parse a fingerprint from a message, or None if it's empty/invalid — e.g. a
+    refusal (no text block) or non-JSON. Guards the run from one bad row (an empty
+    `{}` slipping into the render/aggregation and crashing the whole map)."""
+    txt = next((b.text for b in msg.content if b.type == "text"), "")
+    if not txt:
+        return None
+    try:
+        fp = json.loads(txt)
+    except json.JSONDecodeError:
+        return None
+    return fp if "energy_input" in fp else None
 
 
 def run_map(model: str, limit: int | None, concurrency: int, use_batch: bool) -> None:
@@ -148,17 +175,20 @@ def run_map(model: str, limit: int | None, concurrency: int, use_batch: bool) ->
         reqs = [{"custom_id": cid, "params": _map_params(p, model)} for cid, p in idmap.items()]
         for cid, msg in submit_and_collect(client, reqs, label="map").items():
             p = idmap[cid]
-            if msg is None:
+            fp = _parse_fp(msg) if msg is not None else None
+            if fp is None:
                 errors += 1
                 continue
-            fp = json.loads(next((b.text for b in msg.content if b.type == "text"), "{}"))
             fingerprints.append(_finish_fp(fp, p))
     else:
         def work(p):
             create = client.beta.messages.create if _fable_kwargs(model) else client.messages.create
             try:
                 resp = create(**_map_params(p, model), **_fable_kwargs(model))
-                fp = json.loads(next((b.text for b in resp.content if b.type == "text"), "{}"))
+                fp = _parse_fp(resp)
+                if fp is None:
+                    return {"patent_number": p["patent_number"],
+                            "_error": f"empty/invalid response (stop={getattr(resp, 'stop_reason', '?')})"}
                 return _finish_fp(fp, p)
             except Exception as e:  # noqa: BLE001
                 return {"patent_number": p["patent_number"], "_error": str(e)}

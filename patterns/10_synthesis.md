@@ -1,5 +1,15 @@
 # Pattern 10: Synthesis — The Common Thread
 
+> ⚠️ **Superseded (2026-07).** The "meta-pattern" below was derived from
+> keyword-frequency counting over one-sentence abstracts. A mechanism-level
+> re-read of the enriched corpus (766 of 768 patents fingerprinted) found only
+> **13 patents** actually combine non-linear + resonance + pulsed, and only
+> **6** of those claim an anomalous effect — the recipe was largely a keyword
+> artifact. For the corrected analysis and the revised, falsification-first
+> experiment ranking, see **[11_semantic_synthesis.md](11_semantic_synthesis.md)**
+> and **[12_revised_experiment_priorities.md](12_revised_experiment_priorities.md)**.
+> The material below is retained for provenance.
+
 ## The Meta-Pattern
 
 After analyzing 768 patents across 6 categories, one meta-pattern emerges:
